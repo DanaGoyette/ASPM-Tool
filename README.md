@@ -1,5 +1,5 @@
 # ASPM-Tool
-`aspm-tool.py` is a python script that can read and modify PCI ASPM settings using `lspci` and `setpci`. It uses z8's fantastic `aspm.py` code to set the ASPM settings. It can list devices, their current setting and what setting they claim to support. You can set with `auto`, and it will configure all devices, identifying the corresponding root_complex and configure it to match. You can instead specify PCI devices by their address and mode to force a particular configuration if needed.
+`aspm-tool.py` is a python script that can read and modify PCI ASPM settings using `lspci` and `setpci`. It uses z8's fantastic `aspm.py` [code](https://github.com/0x666690/ASPM) to set the ASPM settings, making it a bit easier to use. It can list devices, their current setting and what setting they claim to support. You can set with `auto`, and it will configure all devices, identifying the corresponding root_complex and configure it to match. You can instead specify PCI devices by their address and mode to force a particular configuration if needed.
 
 #### Warning
 This tool performs writes to your PCI device configuration registers based on regex of command line tools. This should be a last resort when configuring such things, your BIOS, OS and device drivers really should be doing this for you. While this tool on it's own worked for me running OmniOS, you may need to also use `ASPMEnabler` and/or change the myriad of things z8 goes through on their [blog post](https://z8.re/blog/aspm).
@@ -19,11 +19,11 @@ Will print out all device details by default.
 options:
 	-h, --help      show this help message and exit
 	-d DEVICE, --device DEVICE
-									Specify device address. Can be just the endpoint or root/endpoint.
-									Eg '00:02.0' or '00:08.1/04:00.5'
+                  Specify device address. Can be just the endpoint or root/endpoint.
+                  Eg '00:02.0' or '00:08.1/04:00.5'
 	-s {auto,disable,L0s,L1,L0s_AND_L1}, --set {auto,disable,L0s,L1,L0s_AND_L1}
-									Set ASPM mode, auto will set according to device's reported capability.
-									Combine with -d to specify a particular device to apply the setting to.
+                  Set ASPM mode, auto will set according to device's reported capability.
+                  Combine with -d to specify a particular device to apply the setting to.
 	-v, --verbose   Verbose output when setting.
 
 examples:
