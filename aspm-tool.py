@@ -17,6 +17,7 @@ class ASPM(Enum):
 
 @dataclass
 class Device:
+	domain: str
 	addr: str
 	path: str
 	name: str
@@ -172,14 +173,15 @@ def identify_devices():
 			"lspci",
 			"-nn",
 			"-PP",
+			"-D"
 		], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 	
 	output, errs = p.communicate()
 	for line in output.decode().splitlines():
 		parts = line.split(' ')
-		path = parts[0]
+		(domain, path) = parts[0].split(':', 1)
 		addr = path.split('/')[-1]
-		new_device = Device(addr=addr, path=path, name=' '.join(parts[1:]))
+		new_device = Device(domain=domain,addr=addr, path=path, name=' '.join(parts[1:]))
 		new_device = read_capability(new_device)
 		dev_list.append(new_device)
 	return filter(None, dev_list)
@@ -216,7 +218,12 @@ def main():
 	
 	# Device specified, reduce list to single device matching that address
 	if args.device:
-		selected_device = next((dev for dev in dev_list if dev.addr == args.device or dev.addr[-7:] == args.device), None)
+		if re.search(r'^[0-9a-f]{4}:', args.device):
+			(domain, addr) = args.device.split(':', 1)
+		else:
+			domain = '0000'
+			addr = args.device
+		selected_device = next((dev for dev in dev_list if dev.addr == addr and dev.domain == domain), None)
 		if selected_device:
 			dev_list = [selected_device]
 		else:
@@ -239,7 +246,7 @@ def main():
 	else:
 		# Just print
 		for device in dev_list:
-			print(f"{device.addr} {device.name}")
+			print(f"{device.domain}:{device.addr} {device.name}")
 			print(f"\tPath: {device.path}")
 			print(f"\tCapable: {device.cap.name}")
 			print(f"\tCurrent: {device.mode.name}")
