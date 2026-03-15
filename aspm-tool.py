@@ -18,6 +18,7 @@ class ASPM(Enum):
 @dataclass
 class Device:
 	addr: str
+	path: str
 	name: str
 	cap: ASPM = ASPM.ASPM_DISABLED
 	mode: ASPM = ASPM.ASPM_DISABLED
@@ -121,9 +122,9 @@ def patch_device(addr, mode):
 
 
 def set_device(device, mode):
-	if "/" in device.addr:
-		patch_device(device.addr.split('/')[0], mode)
-		patch_device(device.addr.split('/')[1], mode)
+	if "/" in device.path:
+		patch_device(device.path.split('/')[-2], mode)
+		patch_device(device.path.split('/')[-1], mode)
 	else:
 		patch_device(device.addr, mode)
 
@@ -169,13 +170,16 @@ def identify_devices():
 	dev_list = []
 	p = subprocess.Popen([
 			"lspci",
+			"-nn",
 			"-PP",
 		], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 	
 	output, errs = p.communicate()
 	for line in output.decode().splitlines():
 		parts = line.split(' ')
-		new_device = Device(addr=parts[0], name=' '.join(parts[1:]))
+		path = parts[0]
+		addr = path.split('/')[-1]
+		new_device = Device(addr=addr, path=path, name=' '.join(parts[1:]))
 		new_device = read_capability(new_device)
 		dev_list.append(new_device)
 	return filter(None, dev_list)
@@ -235,8 +239,8 @@ def main():
 	else:
 		# Just print
 		for device in dev_list:
-			print(device.name)
-			print(f"\tAddress: {device.addr}")
+			print(f"{device.addr} {device.name}")
+			print(f"\tPath: {device.path}")
 			print(f"\tCapable: {device.cap.name}")
 			print(f"\tCurrent: {device.mode.name}")
 			print("")
