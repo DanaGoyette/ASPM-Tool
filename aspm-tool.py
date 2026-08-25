@@ -15,6 +15,9 @@ class ASPM(Enum):
 	L0s_AND_L1 = 0b11
 
 
+HEX = r"[0-9a-fA-F]"
+
+
 @dataclass
 class Device:
 	domain: str
@@ -37,18 +40,15 @@ def parse_pci_address(addr):
 			return '0000', addr
 		root = parts[0]
 		leaf = parts[-1]
-		domain = '0000'
-		if re.fullmatch(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]", root):
+		if re.fullmatch(rf"{HEX}{{4}}:{HEX}{{2}}:{HEX}{{2}}\.{HEX}", root):
 			domain, _ = root.split(':', 1)
-		if re.fullmatch(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]", leaf):
-			_, rest = leaf.split(':', 1)
-			return domain.lower(), rest
-		return domain.lower(), leaf
+			return domain.lower(), leaf
+		return '0000', leaf
 	else:
-		if re.fullmatch(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]", addr):
+		if re.fullmatch(rf"{HEX}{{4}}:{HEX}{{2}}:{HEX}{{2}}\.{HEX}", addr):
 			domain, rest = addr.split(':', 1)
 			return domain.lower(), rest
-		if re.fullmatch(r"[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]", addr):
+		if re.fullmatch(rf"{HEX}{{2}}:{HEX}{{2}}\.{HEX}", addr):
 			return '0000', addr
 		return '0000', addr
 
