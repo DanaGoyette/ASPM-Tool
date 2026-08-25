@@ -98,7 +98,7 @@ def patch_byte(device, position, value):
 
 
 def patch_device(addr, mode):
-	print(f"Setting device {addr} to {mode.name}...")
+	print(f"Checking {addr}:")
 	endpoint_bytes = read_all_bytes(addr)
 	byte_position_to_patch = find_byte_to_patch(endpoint_bytes, 0x34)
 
@@ -107,8 +107,7 @@ def patch_device(addr, mode):
 	log.info(f"-> {ASPM(int(endpoint_bytes[byte_position_to_patch]) & 0b11).name}")
 
 	if int(endpoint_bytes[byte_position_to_patch]) & 0b11 != mode.value:
-		log.info("Value doesn't match the one we want, setting it!")
-		
+		print(f"  Device {addr} mode differs from {mode.name}, changing it...")
 		patched_byte = int(endpoint_bytes[byte_position_to_patch])
 		patched_byte = patched_byte >> 2
 		patched_byte = patched_byte << 2
@@ -119,12 +118,13 @@ def patch_device(addr, mode):
 		log.info(f"Byte is now set to {hex(new_bytes[byte_position_to_patch])}")
 		log.info(f"-> {ASPM(int(new_bytes[byte_position_to_patch]) & 0b11).name}")
 	else:
-		print(f"Device {addr} is already set to {mode.name}!")
+		print(f"  Device {addr} is already set to {mode.name}!")
 
 
 def set_device(device, mode):
 	if "/" in device.path:
-		patch_device(device.path.split('/')[-2], mode)
+		# Is it really correct to patch the parent?  That seems iffy.
+		# patch_device(device.path.split('/')[-2], mode)
 		patch_device(device.path.split('/')[-1], mode)
 	else:
 		patch_device(device.addr, mode)
