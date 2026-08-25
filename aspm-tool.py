@@ -24,6 +24,34 @@ class Device:
 	cap: ASPM = ASPM.ASPM_DISABLED
 	mode: ASPM = ASPM.ASPM_DISABLED
 
+	@property
+	def pci_addr(self):
+		return f"{self.domain}:{self.addr}"
+
+
+def parse_pci_address(addr):
+	addr = addr.strip()
+	if '/' in addr:
+		parts = [p for p in addr.split('/') if p]
+		if not parts:
+			return '0000', addr
+		root = parts[0]
+		leaf = parts[-1]
+		domain = '0000'
+		if re.fullmatch(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]", root):
+			domain, _ = root.split(':', 1)
+		if re.fullmatch(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]", leaf):
+			_, rest = leaf.split(':', 1)
+			return domain.lower(), rest
+		return domain.lower(), leaf
+	else:
+		if re.fullmatch(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]", addr):
+			domain, rest = addr.split(':', 1)
+			return domain.lower(), rest
+		if re.fullmatch(r"[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]", addr):
+			return '0000', addr
+		return '0000', addr
+
 
 help_des = '''View and set PCI device's ASPM settings.
 
@@ -127,7 +155,7 @@ def set_device(device, mode):
 		# patch_device(device.path.split('/')[-2], mode)
 		patch_device(device.path.split('/')[-1], mode)
 	else:
-		patch_device(device.addr, mode)
+		patch_device(device.pci_addr, mode)
 
 
 def string_to_aspm(input):
@@ -141,14 +169,11 @@ def string_to_aspm(input):
 
 
 def read_capability(device):
-	device_addr = device.addr
-	if '/' in device.addr:
-		device_addr = device.addr.split('/')[1]
 	p = subprocess.Popen([
 		"lspci",
 		"-vv",
 		"-s",
-		device_addr,
+		device.pci_addr,
 	], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 	output, errs = p.communicate()
 	output_text = output.decode()
@@ -179,9 +204,11 @@ def identify_devices():
 	output, errs = p.communicate()
 	for line in output.decode().splitlines():
 		parts = line.split(' ')
-		(domain, path) = parts[0].split(':', 1)
-		addr = path.split('/')[-1]
-		new_device = Device(domain=domain,addr=addr, path=path, name=' '.join(parts[1:]))
+		if not parts:
+			continue
+		path = parts[0]
+		(domain, addr) = parse_pci_address(path)
+		new_device = Device(domain=domain, addr=addr, path=path, name=' '.join(parts[1:]))
 		new_device = read_capability(new_device)
 		dev_list.append(new_device)
 	return filter(None, dev_list)
@@ -218,11 +245,7 @@ def main():
 	
 	# Device specified, reduce list to single device matching that address
 	if args.device:
-		if re.search(r'^[0-9a-f]{4}:', args.device):
-			(domain, addr) = args.device.split(':', 1)
-		else:
-			domain = '0000'
-			addr = args.device
+		(domain, addr) = parse_pci_address(args.device)
 		selected_device = next((dev for dev in dev_list if dev.addr == addr and dev.domain == domain), None)
 		if selected_device:
 			dev_list = [selected_device]
