@@ -402,10 +402,17 @@ def main():
         offset = find_l1ss_offset(decoded_txt, debug=args.debug)
 
     if offset is None:
-        print('Could not find L1 PM Substates capability in decoded `lspci -vv`.')
-        print('Use --offset to specify manually or run with --status to inspect. Raw guessing is only available with --dry-parse.')
-        # If debug requested, show any nearby lines that mention L1 or L1 PM Substates
-        return
+        print('Could not find L1 PM Substates capability in `lspci -vv` output.')
+        print('Use --offset to specify the capability manually, or run with --dry-parse to allow raw-guess heuristics.')
+        # If debug requested, show any nearby lines that mention L1, ASPM or related keywords
+        if args.debug:
+            print('\n--- Debug: nearby lines mentioning L1/ASPM ---')
+            for i, line in enumerate(decoded_txt.splitlines(), start=1):
+                if 'L1' in line or 'ASPM' in line or 'L1Sub' in line or 'L1 PM Substates' in line:
+                    padded_num = pad_number(i, len(decoded_txt.splitlines()))
+                    print(f'> {padded_num}: {line}')
+            print('--- end debug ---\n')
+        sys.exit(0)
 
     if args.dry_parse:
         if offline_mode and not raw_txt:

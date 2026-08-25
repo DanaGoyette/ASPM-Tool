@@ -26,6 +26,7 @@ class Device:
 	name: str
 	cap: ASPM = ASPM.ASPM_DISABLED
 	mode: ASPM = ASPM.ASPM_DISABLED
+	supports_aspm: bool = False
 
 	@property
 	def pci_addr(self):
@@ -150,6 +151,9 @@ def patch_device(addr, mode):
 
 
 def set_device(device, mode):
+	if not device.supports_aspm:
+		print(f"  Device {device.pci_addr} has no ASPM capability; skipping.")
+		return
 	if "/" in device.path:
 		# Is it really correct to patch the parent?  That seems iffy.
 		# patch_device(device.path.split('/')[-2], mode)
@@ -177,19 +181,22 @@ def read_capability(device):
 	], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 	output, errs = p.communicate()
 	output_text = output.decode()
-	if "LnkCap:" not in output_text:
-		# Device has no link to configure, remove from list
-		return None
-	else:
-		cap_pattern = r', ASPM.*?,'
-		cap_match = re.search(cap_pattern, output_text)
-		state_pattern = r'LnkCtl:\tASPM.*;'
-		state_match = re.search(state_pattern, output_text)
-		if state_match:
-			device.mode = string_to_aspm(state_match.group())
-		if cap_match:
-			device.cap = string_to_aspm(cap_match.group())
+	device.supports_aspm = "LnkCap:" in output_text
+	if not device.supports_aspm:
+		# Keep the device in the list so address lookups still work, even when it
+		# doesn't expose a PCIe link that can be configured for ASPM.
+		device.cap = ASPM.ASPM_DISABLED
+		device.mode = ASPM.ASPM_DISABLED
 		return device
+	cap_pattern = r', ASPM.*?,'
+	cap_match = re.search(cap_pattern, output_text)
+	state_pattern = r'LnkCtl:\tASPM.*;'
+	state_match = re.search(state_pattern, output_text)
+	if state_match:
+		device.mode = string_to_aspm(state_match.group())
+	if cap_match:
+		device.cap = string_to_aspm(cap_match.group())
+	return device
 
 
 def identify_devices():
@@ -211,7 +218,7 @@ def identify_devices():
 		new_device = Device(domain=domain, addr=addr, path=path, name=' '.join(parts[1:]))
 		new_device = read_capability(new_device)
 		dev_list.append(new_device)
-	return filter(None, dev_list)
+	return dev_list
 
 
 def main():
@@ -271,8 +278,11 @@ def main():
 		for device in dev_list:
 			print(f"{device.domain}:{device.addr} {device.name}")
 			print(f"\tPath: {device.path}")
-			print(f"\tCapable: {device.cap.name}")
-			print(f"\tCurrent: {device.mode.name}")
+			if (device.supports_aspm):
+				print(f"\tCapable: {device.cap.name}")
+				print(f"\tCurrent: {device.mode.name}")
+			else:
+				print(f"\tCapable: No")
 			print("")
 
 
