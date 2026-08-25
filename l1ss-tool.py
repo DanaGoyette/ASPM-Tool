@@ -251,11 +251,16 @@ def default_l1ss_write_for_level(level):
       bit 2 = ASPM_L1.2
       bit 3 = ASPM_L1.1
     """
-    if level == '1.1':
+    if not level:
+        level = '1.1'
+    if level == 'both':
+        return 0x0F, 0x0F
+    elif level == '1.1':
         return 0x0F, 0x08
-    if level == '1.2':
+    elif level == '1.2':
         return 0x0F, 0x04
-    return 0x0F, 0x0F
+    else:
+        raise ValueError(f'Unknown level: {level}')
 
 
 def detect_bits_from_lspci(lspci_text, orig):
@@ -327,7 +332,7 @@ def resolve_l1ss_write_target(args, orig, decoded_txt):
         except Exception:
             raise ValueError('Invalid mask/value')
 
-    if args.auto_detect:
+    else:
         detected = detect_bits_from_lspci(decoded_txt, orig)
         if detected and detected[0] is not None:
             mask, value, details = detected
@@ -350,7 +355,6 @@ def main():
     parser.add_argument('--trial', action='store_true', help='Temporarily set bits then restore after --wait seconds (allows trying without permanent change)')
     parser.add_argument('--wait', type=int, default=5, help='Seconds to wait in --trial mode before restoring (default 5)')
     parser.add_argument('--level', choices=('1.1','1.2','both'), default='both', help='Which L1 substate(s) to try in --trial mode')
-    parser.add_argument('--auto-detect', action='store_true', help='Attempt to detect bit positions from lspci text and current register')
     parser.add_argument('--restore', help='Restore a backup file created by this tool (provide backup file path)')
     parser.add_argument('--debug', action='store_true', help='Print debug info (show lspci output used)')
     parser.add_argument('--dry-parse', action='store_true', help='Print detected/guessed capability offsets and masks (no writes)')
@@ -403,9 +407,9 @@ def main():
 
     if offset is None:
         print('Could not find L1 PM Substates capability in `lspci -vv` output.')
-        print('Use --offset to specify the capability manually, or run with --dry-parse to allow raw-guess heuristics.')
         # If debug requested, show any nearby lines that mention L1, ASPM or related keywords
         if args.debug:
+            print('Use --offset to specify the capability manually, or run with --dry-parse to allow raw-guess heuristics.')
             print('\n--- Debug: nearby lines mentioning L1/ASPM ---')
             for i, line in enumerate(decoded_txt.splitlines(), start=1):
                 if 'L1' in line or 'ASPM' in line or 'L1Sub' in line or 'L1 PM Substates' in line:
@@ -521,115 +525,68 @@ def main():
         print(f"Readback after restore: 0x{written_val:08x}")
         return
 
-    if args.write:
+    if args.trial or args.write:
         # Determine mask/value: prefer explicit args, otherwise allow auto-detect
         if not args.mask or not args.value:
-            if not args.auto_detect:
-                print('Writes require --mask and --value to be specified.')
-                return
             ctl1_off = offset + 0x08
             orig_tmp = setpci_read(busid, ctl1_off, 'L')
             try:
                 mask, val = resolve_l1ss_write_target(args, orig_tmp, decoded_txt)
             except ValueError as exc:
-                print(str(exc))
-                return
+                raise
             detected = detect_bits_from_lspci(decoded_txt, orig_tmp)
             if detected and detected[0] is not None:
                 print('Auto-detected mask/value from decoded lspci:')
                 print(detected[2])
-            if mask == 0 and val == 0:
-                print('Auto-detection failed from decoded lspci; please supply --mask and --value')
-                return
+            if mask == 0:
+                print('Auto-detection failed from decoded lspci; cannot write without explicit --mask and --value or --level')
+                sys.exit(1)
         else:
             try:
                 mask = int(args.mask, 16)
                 val = int(args.value, 16)
             except Exception:
                 print('Invalid mask/value')
-                return
+                sys.exit(1)
 
         ctl1_off = offset + 0x08
         orig = backup_register(busid, ctl1_off)
         try:
             new = compute_new_value(orig, mask, val)
         except Exception:
-            print('Error computing new value')
-            return
+            raise
         print(f'Original L1SUBCTL1 @ 0x{ctl1_off:x}: 0x{orig:08x}')
+        action_desc = 'trial write' if args.trial else 'write'
         print(f'Planned new value: 0x{new:08x} (mask 0x{mask:x}, value 0x{val:x})')
         if not args.force:
-            print('Dry-run: use --force to actually perform the write')
+            print(f'Dry-run: use --force to actually perform the {action_desc}')
             return
-        print('Performing write...')
+
+        print(f'Performing {action_desc}...')
         ok, written_val = perform_write_and_verify(busid, ctl1_off, new)
         pretty_print_l1ss_lspci(run_lspci_vv(busid), 'after write')
-        if ok:
-            print(f'Write verified: 0x{written_val:08x}')
-        else:
+
+        if not ok:
             print(f'Write mismatch (read 0x{written_val:08x}), restoring original...')
             restore_register(busid, ctl1_off, orig)
             print('Restored.')
             pretty_print_l1ss_lspci(run_lspci_vv(busid), 'after restore')
-                    
-        return
+            return
 
-    if args.trial:
-        # Trial mode: compute default mask/value for level if not provided, write, wait, restore
-        ctl1_off = offset + 0x08
-        orig = backup_register(busid, ctl1_off)
-        # Determine mask/value
-        if args.mask and args.value:
+        print(f'Write verified: 0x{written_val:08x}')
+
+        # For trial mode, wait then restore the original value regardless of success
+        if args.trial:
             try:
-                mask = int(args.mask, 16)
-                val = int(args.value, 16)
-            except Exception:
-                print('Invalid mask/value')
-                return
-        else:
-            if args.auto_detect:
-                detected = detect_bits_from_lspci(decoded_txt, orig)
-                if detected and detected[0] is not None:
-                    mask, value, details = detected
-                    if value == 0 and args.level in ('1.1', '1.2', 'both'):
-                        mask, value = default_l1ss_write_for_level(args.level)
-                        details['note'] = 'No current L1SS bits enabled; using --level default'
-                    print('Auto-detected mask/value from decoded lspci:')
-                    print(details)
-                    val = value
-                else:
-                    print('Auto-detection failed from decoded lspci; falling back to conservative defaults')
-                    mask = None
-            else:
-                mask = None
-            if mask is None:
-                mask, val = default_l1ss_write_for_level(args.level)
-        try:
-            new = compute_new_value(orig, mask, val)
-        except Exception:
-            print('Error computing new value')
-            return
-        print(f'Original L1SUBCTL1 @ 0x{ctl1_off:x}: 0x{orig:08x}')
-        print(f'Trial new value: 0x{new:08x} (mask 0x{mask:x}, value 0x{val:x})')
-        if not args.force:
-            print('Dry-run: use --force to actually perform the trial write')
-            return
-        try:
-            print('Performing trial write...')
-            ok, written_val = perform_write_and_verify(busid, ctl1_off, new)
-            print(f'Readback after write: 0x{written_val:08x}')
-            pretty_print_l1ss_lspci(run_lspci_vv(busid), 'during trial')
-            print(f'Waiting {args.wait} seconds before restoring...')
-            time.sleep(args.wait)
-        except Exception as e:
-            print(f'Error during trial write: {e}')
-            raise
-        finally:
-            print('Restoring original value...')
-            restored_val = restore_register(busid, ctl1_off, orig)
-            print(f'Readback after restore: 0x{restored_val:08x}')
-            pretty_print_l1ss_lspci(run_lspci_vv(busid), 'after restore')
-
+                print(f'Waiting {args.wait} seconds before restoring...')
+                time.sleep(args.wait)
+            except Exception as e:
+                print(f'Error during trial wait: {e}')
+            finally:
+                print('Restoring original value...')
+                restored_val = restore_register(busid, ctl1_off, orig)
+                print(f'Readback after restore: 0x{restored_val:08x}')
+                pretty_print_l1ss_lspci(run_lspci_vv(busid), 'after restore')
 
 if __name__ == '__main__':
     main()
