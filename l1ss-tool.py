@@ -160,6 +160,11 @@ def pretty_print_l1ss_lspci(lspci_text, title='L1 Substates info from lspci -vv'
             padded_num = pad_number(line_num, last_line_num)
             print(f"  {padded_num}: {line.strip()}")
 
+POLICIES = {
+    "off":  0x00,
+    "l1.1": 0x0A,  # PCI-PM + ASPM L1.1
+    "l1.2": 0x0F,  # everything
+}
 
 CAP_AND_CTL_COMMON_NAMES = OrderedDict([
     ('pci_pm_l1_2', 'PCI-PM L1.2'),
@@ -314,14 +319,7 @@ def default_l1ss_write_for_level(level):
       bit 2 = ASPM_L1.2
       bit 3 = ASPM_L1.1
     """
-    if level == 'both':
-        return 0x0F, 0x0F
-    elif level == '1.1':
-        return 0x0F, 0x08
-    elif level == '1.2':
-        return 0x0F, 0x04
-    else:
-        raise ValueError(f'Unknown level: {level}')
+    return 0x0F, POLICIES[level]
 
 
 def detect_bits_from_lspci(lspci_text):
@@ -384,7 +382,7 @@ def main():
     parser.add_argument('--force', action='store_true', help='Actually perform the write')
     parser.add_argument('--trial', action='store_true', help='Temporarily set bits then restore after --wait seconds (allows trying without permanent change)')
     parser.add_argument('--wait', type=int, default=5, help='Seconds to wait in --trial mode before restoring (default 5)')
-    parser.add_argument('--level', choices=('1.1','1.2','both'), default='1.1', help='Which L1 substate(s) to try in --trial mode')
+    parser.add_argument('--level', choices=[None].extend(POLICIES.keys()), required=False, help='Which L1 substate(s) to enable up through')
     parser.add_argument('--restore', help='Restore a backup file created by this tool (provide backup file path)')
     parser.add_argument('--debug', action='store_true', help='Print debug info (show lspci output used)')
     parser.add_argument('--lspci-file', help='Use a saved lspci -vv output file instead of running lspci')
@@ -469,16 +467,9 @@ def main():
     ctl1_off = offset + 0x08
     if not offline_mode:
         ctl1_val_orig = setpci_read(busid, ctl1_off, 'L')
-    try:
-        detected = detect_bits_from_lspci(decoded_txt)
-        if detected and detected[0] is not None:
-            mask, val, _ = detected
-            if val == 0 and args.level in ('1.1', '1.2', 'both'):
-                mask, val = default_l1ss_write_for_level(args.level)
-        else:
-            mask, val = default_l1ss_write_for_level(args.level)
-    except ValueError as exc:
-        raise
+
+    mask=None
+    val=None
     (old_mask, old_val, info) = detect_bits_from_lspci(decoded_txt)
     if old_mask is not None and old_val is not None:
         print('Auto-detected mask/value from decoded lspci:')
@@ -487,15 +478,20 @@ def main():
             print(f"  ctl1=(unknown)")
         else:
             print(f"  ctl1=0x{ctl1_val_orig:08x}")
-        print(f"  mask=0x{mask:08x}"); 
-        print(f'   val=0x{val:08x}')
+        print(f"  mask=0x{old_mask:08x}"); 
+        print(f'   val=0x{old_val:08x}')
         for (k,v) in info['flags'].items():
             print(f"  ctl1[{v['bit']}] = {v['state']} ({k})")
 
+    if args.level:
+        mask, val = default_l1ss_write_for_level(args.level)
+    else:
+        # use existing level
+        mask = old_mask
+        val = old_val
     if mask == 0:
         print('Auto-detection failed from decoded lspci; cannot write')
         sys.exit(1)
-    mask, val = default_l1ss_write_for_level(args.level)
 
     if args.restore:
         if offline_mode:
@@ -542,7 +538,7 @@ def main():
             raise
         print(f'Original L1SUBCTL1 @ 0x{ctl1_off:x}: 0x{orig:08x}')
         print(f'Planned new value: 0x{new_ctl1_val:08x} (mask 0x{mask:x}, value 0x{val:x})')
-        pretty_print_l1subctl1(new_ctl1_val, ctl1_off, ' ', regs['L1SUBCAP'])
+        pretty_print_l1subctl1(new_ctl1_val, ctl1_off, cap_val=regs['L1SUBCAP'])
 
         action_desc = 'trial write' if args.trial else 'write'
         if offline_mode:
