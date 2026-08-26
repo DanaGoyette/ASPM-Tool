@@ -3,10 +3,10 @@
 
 Usage:
   l1ss-tool.py -d 00:01.0 --status
-  l1ss-tool.py -d 00:01.0 --write --offset 0x1fc --mask 0x30 --value 0x30 --force
+  l1ss-tool.py -d 00:01.0 --write --level 1.1 --force
 
 This tool only operates on one device and is conservative: writes require
-explicit --offset, --mask, --value and --force. It backs up the original
+correct auto-detection of the mask and value. It backs up the original
 register value to the current directory before writing.
 """
 import argparse
@@ -15,6 +15,8 @@ import re
 import os
 import sys
 import time
+
+from collections import OrderedDict
 
 # Pad a number to match the length of the largest number in another variable
 
@@ -120,7 +122,7 @@ def parse_lspci_raw_to_bytes(raw_txt):
 
 
 def read_regs_from_raw(raw_txt, base):
-    """Return (cap, ctl1, ctl2) ints from raw dump for given capability base."""
+    """Return a dictionary from reg name to int value from raw dump for given capability base."""
     ba = parse_lspci_raw_to_bytes(raw_txt)
     if not ba:
         return None
@@ -132,38 +134,8 @@ def read_regs_from_raw(raw_txt, base):
     cap = int.from_bytes(ba[cap_off:cap_off+4], 'little')
     ctl1 = int.from_bytes(ba[ctl1_off:ctl1_off+4], 'little')
     ctl2 = int.from_bytes(ba[ctl2_off:ctl2_off+4], 'little')
-    return (cap, ctl1, ctl2)
+    return {'L1SUBCAP': cap, 'L1SUBCTL1': ctl1, 'L1SUBCTL2': ctl2}
 
-
-def guess_offset_mask_from_raw(raw_txt):
-    """Heuristic: scan the raw config dump for places where the 32-bit word
-    at offset+0x08 contains ASPM L1.1/L1.2 bits (0x10/0x20). Return a tuple
-    (cap_base_offset, mask, value, details) or (None, None, None, details).
-    """
-    ba = parse_lspci_raw_to_bytes(raw_txt)
-    details = {'candidates': []}
-    if not ba:
-        return None, None, None, details
-    maxoff = len(ba)
-    # scan reasonable range (0..maxoff-12)
-    for off in range(0, maxoff - 12):
-        ctl1_off = off + 0x08
-        if ctl1_off + 4 > maxoff:
-            continue
-        val = int.from_bytes(ba[ctl1_off:ctl1_off + 4], 'little')
-        # prefer locations where L1.1 or L1.2 bits appear
-        if (val & 0x30) != 0:
-            details['candidates'].append({'base': off, 'ctl1': val})
-            mask = 0
-            value = 0
-            if val & 0x10:
-                mask |= 0x10
-                value |= 0x10
-            if val & 0x20:
-                mask |= 0x20
-                value |= 0x20
-            return off, mask, value, details
-    return None, None, None, details
 
 
 def setpci_read(dev, offset, size='L'):
@@ -188,29 +160,120 @@ def pretty_print_l1ss_lspci(lspci_text, title='L1 Substates info from lspci -vv'
             padded_num = pad_number(line_num, last_line_num)
             print(f"  {padded_num}: {line.strip()}")
 
-def pretty_print_l1ss(dev, offset, regs=None, offline_mode=False):
-    """Print L1SUB registers. If regs tuple (cap,ctl1,ctl2) is provided, use
-    that instead of calling setpci. When offline_mode is True and regs is
-    None, do not attempt to call setpci and instead indicate registers are
-    unavailable."""
-    if offline_mode and regs is None:
-        raise ValueError('Offline: no raw file provided; register values are not available')
-        
-    print(f"L1 PM Substates capability found at 0x{offset:x}")
+
+CAP_AND_CTL_COMMON_NAMES = OrderedDict([
+    ('pci_pm_l1_2', 'PCI-PM L1.2'),
+    ('pci_pm_l1_1', 'PCI-PM L1.1'),
+    ('aspm_l1_2', 'ASPM L1.2'),
+    ('aspm_l1_1', 'ASPM L1.1'),
+])
+
+CAP_AND_CTL_STATE_DESCS = {
+    (None, None): None,
+    (None, False): 'Disabled',
+    (None, True): 'Enabled',
+    (False, False): None,
+    (False, True): 'Forced enabled (unsupported)',
+    (True, False): 'Disabled',
+    (True, True): 'Enabled'
+}
+
+def parse_l1subcap(reg_val):
+    return {
+        'raw': reg_val,
+        'pci_pm_l1_2': bool(reg_val & (1 << 0)),
+        'pci_pm_l1_1': bool(reg_val & (1 << 1)),
+        'aspm_l1_2': bool(reg_val & (1 << 2)),
+        'aspm_l1_1': bool(reg_val & (1 << 3)),
+        'l1_pm_substates': bool(reg_val & (1 << 4)),
+    }
+
+
+def parse_l1subctl1(reg_val):
+    return {
+        'raw': reg_val,
+        'pci_pm_l1_2': bool(reg_val & (1 << 0)),
+        'pci_pm_l1_1': bool(reg_val & (1 << 1)),
+        'aspm_l1_2': bool(reg_val & (1 << 2)),
+        'aspm_l1_1': bool(reg_val & (1 << 3)),
+    }
+
+def parse_l1subctl2(reg_val):
+    return {
+        "raw": reg_val,
+
+        # bits 0-7
+        "t_power_on_value":
+            reg_val & 0xff,
+
+        # bits 8-9
+        "t_power_on_scale":
+            (reg_val >> 8) & 0x3,
+    }
+
+def pretty_print_l1subcap(cap_val, offset, indent=''):
+    cap_info = parse_l1subcap(cap_val)
+    print(f"{indent}[0x{offset:x}] L1SUBCAP=0x{cap_val:08x}")
+    for key, name in CAP_AND_CTL_COMMON_NAMES.items():
+        if cap_info[key]:
+            print(f"{indent}  {name}: Supported")
+    if cap_info['l1_pm_substates']:
+        print(f"{indent}  L1 PM Substates: Supported")
+
+def pretty_print_l1subctl1(ctl1_val, offset, indent='', cap_val=None):
+    ctl1_info = parse_l1subctl1(ctl1_val)
+    cap_info = parse_l1subcap(cap_val) if cap_val is not None else None
+    print(f"{indent}[0x{offset:x}] L1SUBCTL1=0x{ctl1_val:08x}")
+    for key in CAP_AND_CTL_COMMON_NAMES.keys():
+        state = CAP_AND_CTL_STATE_DESCS[(cap_info and cap_info[key], ctl1_info[key])]
+        name = CAP_AND_CTL_COMMON_NAMES[key] 
+        if state:
+            print(f"{indent}  {name}: {state}")
+
+def decode_t_power_on(value, scale):
+    scale_us = { 0: 2, 1: 10, 2: 100 }
+    if scale not in scale_us:
+        return None
+    return value * scale_us[scale]
+
+def pretty_print_l1subctl2(ctl2_val, offset, indent=''):
+    ctl2_info = parse_l1subctl2(ctl2_val)
+    print(f"{indent}[0x{offset:x}] L1SUBCTL2=0x{ctl2_info['raw']:08x}")
+    power_val = ctl2_info['t_power_on_value']
+    power_scale = ctl2_info['t_power_on_scale']
+    power_time = decode_t_power_on(power_val, power_scale) or '(unknown)'
+    print(f"{indent}  Power On Value: {power_val}")
+    print(f"{indent}  Power On Scale: {power_scale}")
+    print(f"{indent}  (Power On Time) {power_time} us")
+
+def read_regs_from_setpci(dev, offset):
+    """Read L1SUBCAP, L1SUBCTL1, and L1SUBCTL2 registers using setpci."""
+    cap_off = offset + 0x04
     ctl1_off = offset + 0x08
     ctl2_off = offset + 0x0c
-    cap_off = offset + 0x04
-    if regs is not None:
-        cap, ctl1, ctl2 = regs
-    else:
-        cap = setpci_read(dev, cap_off, 'L')
-        ctl1 = setpci_read(dev, ctl1_off, 'L')
-        ctl2 = setpci_read(dev, ctl2_off, 'L')
-    print(f"  L1SUBCAP  @ 0x{cap_off:x}: 0x{cap:08x}")
-    print(f"  L1SUBCTL1 @ 0x{ctl1_off:x}: 0x{ctl1:08x}  ({bin(ctl1)})")
-    print(f"  L1SUBCTL2 @ 0x{ctl2_off:x}: 0x{ctl2:08x}  ({bin(ctl2)})")
-    print("")
+    cap = setpci_read(dev, cap_off, 'L')
+    ctl1 = setpci_read(dev, ctl1_off, 'L')
+    ctl2 = setpci_read(dev, ctl2_off, 'L')
+    return {'L1SUBCAP': cap, 'L1SUBCTL1': ctl1, 'L1SUBCTL2': ctl2}
 
+def pretty_print_l1ss_raw(offset, regs):
+    """Print L1SUB registers nicely formatted."""
+    print(f"L1 Substates from registers: [0x{offset:x}]")
+    cap_off = offset + 0x04
+    ctl1_off = offset + 0x08
+    ctl2_off = offset + 0x0c
+
+    if regs:
+        cap_val = regs['L1SUBCAP']
+        ctl1_val = regs['L1SUBCTL1']
+        ctl2_val = regs['L1SUBCTL2']
+        pretty_print_l1subcap(cap_val, cap_off, '  ')
+        pretty_print_l1subctl1(ctl1_val, ctl1_off, '  ', cap_val)
+        pretty_print_l1subctl2(ctl2_val, ctl2_off, '  ')
+    else:
+        print(f"  L1SUBCAP  @ 0x{cap_off:x}: (unknown)")
+        print(f"  L1SUBCTL1 @ 0x{ctl1_off:x}: (unknown)")
+        print(f"  L1SUBCTL2 @ 0x{ctl2_off:x}: (unknown)")
 
 
 def backup_register(dev, ctl_off):
@@ -251,8 +314,6 @@ def default_l1ss_write_for_level(level):
       bit 2 = ASPM_L1.2
       bit 3 = ASPM_L1.1
     """
-    if not level:
-        level = '1.1'
     if level == 'both':
         return 0x0F, 0x0F
     elif level == '1.1':
@@ -263,7 +324,7 @@ def default_l1ss_write_for_level(level):
         raise ValueError(f'Unknown level: {level}')
 
 
-def detect_bits_from_lspci(lspci_text, orig):
+def detect_bits_from_lspci(lspci_text):
     """Decode the L1SubCtl1 state fields from lspci text.
 
     The L1 PM Substates control register uses the low four bits of L1SubCtl1:
@@ -279,7 +340,7 @@ def detect_bits_from_lspci(lspci_text, orig):
     ctl_line = None
     for line in lspci_text.splitlines():
         if 'L1SubCtl1:' in line or 'L1SubCtl:' in line:
-            ctl_line = line
+            ctl_line = line.strip()
             break
     details = {'line': ctl_line}
     if not ctl_line:
@@ -293,71 +354,39 @@ def detect_bits_from_lspci(lspci_text, orig):
         'ASPM_L1.1': 3,
     }
 
-    wanted = {}
+    flags = {}
     for token in tokens:
         m = re.search(re.escape(token) + r'([+-])', ctl_line)
         if m:
-            wanted[token] = 1 if m.group(1) == '+' else 0
-    details['wanted'] = wanted
+            state = 1 if m.group(1) == '+' else 0
+            flags[token] = {'bit': bit_map[token], 'state': state}
+
+    details['flags'] = flags
 
     mask = 0
     value = 0
-    chosen = {}
-    for token in tokens:
-        if token in wanted:
-            bit = bit_map[token]
-            chosen[token] = bit
-            mask |= (1 << bit)
-            if wanted[token]:
-                value |= (1 << bit)
+    for token, info in flags.items():
+        bit = info['bit']
+        mask |= (1 << bit)
+        if info['state']:
+            value |= (1 << bit)
 
-    details['chosen'] = chosen
-    details['candidates'] = {token: [bit_map[token]] for token in chosen}
-    if not chosen:
+    if not flags:
         return None, None, details
     return mask, value, details
-
-
-def resolve_l1ss_write_target(args, orig, decoded_txt):
-    """Resolve a target mask/value for a write or trial.
-
-    If the user supplied explicit values, respect those. Otherwise prefer the
-    requested --level defaults when auto-detect sees all bits disabled; this
-    avoids writing a zero-value target when the user clearly intends to enable
-    the substate(s).
-    """
-    if args.mask and args.value:
-        try:
-            return int(args.mask, 16), int(args.value, 16)
-        except Exception:
-            raise ValueError('Invalid mask/value')
-
-    else:
-        detected = detect_bits_from_lspci(decoded_txt, orig)
-        if detected and detected[0] is not None:
-            mask, value, details = detected
-            if value == 0 and args.level in ('1.1', '1.2', 'both'):
-                return default_l1ss_write_for_level(args.level)
-            return mask, value
-
-    return default_l1ss_write_for_level(args.level)
 
 
 def main():
     parser = argparse.ArgumentParser(description='L1 Substates tool (single device)')
     parser.add_argument('-d', '--device', required=True, help="PCI device (eg 0000:01:00.0 or 01:00.0)")
-    parser.add_argument('--status', action='store_true', help='Show L1SS capability and control registers')
     parser.add_argument('--write', action='store_true', help='Write L1SS control register (requires offset/mask/value and --force)')
     parser.add_argument('--offset', help='Hex offset of capability (e.g. 0x1fc)')
-    parser.add_argument('--mask', help='Hex mask to apply to the control register (e.g. 0x30)')
-    parser.add_argument('--value', help='Hex value to OR (masked) into the control register (e.g. 0x30)')
     parser.add_argument('--force', action='store_true', help='Actually perform the write')
     parser.add_argument('--trial', action='store_true', help='Temporarily set bits then restore after --wait seconds (allows trying without permanent change)')
     parser.add_argument('--wait', type=int, default=5, help='Seconds to wait in --trial mode before restoring (default 5)')
-    parser.add_argument('--level', choices=('1.1','1.2','both'), default='both', help='Which L1 substate(s) to try in --trial mode')
+    parser.add_argument('--level', choices=('1.1','1.2','both'), default='1.1', help='Which L1 substate(s) to try in --trial mode')
     parser.add_argument('--restore', help='Restore a backup file created by this tool (provide backup file path)')
     parser.add_argument('--debug', action='store_true', help='Print debug info (show lspci output used)')
-    parser.add_argument('--dry-parse', action='store_true', help='Print detected/guessed capability offsets and masks (no writes)')
     parser.add_argument('--lspci-file', help='Use a saved lspci -vv output file instead of running lspci')
     parser.add_argument('--lspci-raw-file', help='Use a saved lspci -xxxx raw output file instead of running lspci -xxxx')
     args = parser.parse_args()
@@ -409,8 +438,8 @@ def main():
         print('Could not find L1 PM Substates capability in `lspci -vv` output.')
         # If debug requested, show any nearby lines that mention L1, ASPM or related keywords
         if args.debug:
-            print('Use --offset to specify the capability manually, or run with --dry-parse to allow raw-guess heuristics.')
-            print('\n--- Debug: nearby lines mentioning L1/ASPM ---')
+            print('Use --offset to specify the capability manually.')
+            print('\n--- Debug: lines mentioning L1/ASPM ---')
             for i, line in enumerate(decoded_txt.splitlines(), start=1):
                 if 'L1' in line or 'ASPM' in line or 'L1Sub' in line or 'L1 PM Substates' in line:
                     padded_num = pad_number(i, len(decoded_txt.splitlines()))
@@ -418,81 +447,60 @@ def main():
             print('--- end debug ---\n')
         sys.exit(0)
 
-    if args.dry_parse:
-        if offline_mode and not raw_txt:
-            print('\nDecoded-detection: offline mode (no raw file); cannot dry-parse')
-            sys.exit(1)
-
-        print('Dry-parse: finding and reporting decoded and raw candidates (no changes)')
-
-        off_guess, mask_guess, val_guess, det_raw = guess_offset_mask_from_raw(raw_txt)
-        if offset is None:
-            # For dry-parse only: try to guess from the raw dump (informational)
-            if off_guess is not None:
-                print(f'Could not find decoded capability; guessed base at 0x{off_guess:x} from raw dump (dry-parse only)')
-                offset = off_guess
-            else:
-                print('Could not find L1 PM Substates capability (decoded or raw).')
-                return
-
-        # raw guesses
-        print('\nRaw-guess detection:')
-        print(det_raw)
-        if off_guess is not None:
-            print(f"Guessed base: 0x{off_guess:x}, mask=0x{mask_guess:x}, value=0x{val_guess:x}")
-        else:
-            print('No raw candidates found')
+    # decoded textual detection (needs ctl1 read if possible)
+    ctl1_off = offset + 0x08
+    ctl1_val_orig = None
+    
+    regs = None
+    if raw_txt:
+        # When offline,extract register values from the raw file (if provided)
+        regs = read_regs_from_raw(raw_txt, offset)
+        if regs and 'L1SUBCTL1' in regs:
+            ctl1_val_orig = regs['L1SUBCTL1']
+    if not offline_mode:
+        regs = read_regs_from_setpci(busid, offset)
         
-        # decoded textual detection (needs ctl1 read if possible)
-        ctl1_off = offset + 0x08
-        
-        if offline_mode:
-            # read from raw dump
-            regs = None
-            try:
-                regs = parse_lspci_raw_to_bytes(raw_txt)
-            except Exception as e:
-                regs = None
-                print('\nDecoded-detection: failed to read bytes from text:', e)
-            if regs is not None and len(regs) > ctl1_off + 3:
-                orig_val = int.from_bytes(regs[ctl1_off:ctl1_off+4], 'little')
-                det_dec = detect_bits_from_lspci(decoded_txt, orig_val)
-                print('\nDecoded-detection:')
-                print(det_dec)
+    print("")
+    pretty_print_l1ss_lspci(decoded_txt)
+    print("")
+    pretty_print_l1ss_raw(offset, regs=regs)
+    print("")
+
+    ctl1_off = offset + 0x08
+    if not offline_mode:
+        ctl1_val_orig = setpci_read(busid, ctl1_off, 'L')
+    try:
+        detected = detect_bits_from_lspci(decoded_txt)
+        if detected and detected[0] is not None:
+            mask, val, _ = detected
+            if val == 0 and args.level in ('1.1', '1.2', 'both'):
+                mask, val = default_l1ss_write_for_level(args.level)
         else:
-            try:
-                orig_val = setpci_read(busid, ctl1_off, 'L')
-                det_dec = detect_bits_from_lspci(decoded_txt, orig_val)
-                print('\nDecoded-detection:')
-                print(det_dec)
-            except Exception as e:
-                print('\nDecoded-detection: failed to read ctl1:', e)
-        return
+            mask, val = default_l1ss_write_for_level(args.level)
+    except ValueError as exc:
+        raise
+    (old_mask, old_val, info) = detect_bits_from_lspci(decoded_txt)
+    if old_mask is not None and old_val is not None:
+        print('Auto-detected mask/value from decoded lspci:')
+        print(f"  {info['line']}")
+        if ctl1_val_orig is None:
+            print(f"  ctl1=(unknown)")
+        else:
+            print(f"  ctl1=0x{ctl1_val_orig:08x}")
+        print(f"  mask=0x{mask:08x}"); 
+        print(f'   val=0x{val:08x}')
+        for (k,v) in info['flags'].items():
+            print(f"  ctl1[{v['bit']}] = {v['state']} ({k})")
 
-    # If the user supplied an lspci file, run in offline mode: disable writes/trials/restores
-    if offline_mode:
-        if args.write or args.trial or args.restore:
-            print('Offline mode: write/trial/restore operations are disabled when using --lspci-file. Run on the target machine to perform writes.')
-            return
-        if (args.status or args.dry_parse) and not raw_txt:
-            print('Offline mode: status or dry-parse requires a raw lspci file (--lspci-raw-file).')
-            sys.exit(1)
-
-    if not (args.write or args.trial or args.restore or args.status or args.dry_parse):
-        args.status = True
-
-    if args.status:
-        # When offline, prefer to extract register values from the raw file (if provided)
-        regs = None
-        if offline_mode:
-            if raw_txt:
-                regs = read_regs_from_raw(raw_txt, offset)
-            else:
-                regs = None
-        pretty_print_l1ss(busid, offset, regs=regs, offline_mode=offline_mode)
-        pretty_print_l1ss_lspci(decoded_txt)
+    if mask == 0:
+        print('Auto-detection failed from decoded lspci; cannot write')
+        sys.exit(1)
+    mask, val = default_l1ss_write_for_level(args.level)
 
     if args.restore:
+        if offline_mode:
+            print('Offline mode: cannot restore from backup file when using --lspci-file. Run on the target machine to perform restore.')
+            return
         backup_file = args.restore
         if not os.path.exists(backup_file):
             print(f"Backup file not found: {backup_file}")
@@ -526,44 +534,26 @@ def main():
         return
 
     if args.trial or args.write:
-        # Determine mask/value: prefer explicit args, otherwise allow auto-detect
-        if not args.mask or not args.value:
-            ctl1_off = offset + 0x08
-            orig_tmp = setpci_read(busid, ctl1_off, 'L')
-            try:
-                mask, val = resolve_l1ss_write_target(args, orig_tmp, decoded_txt)
-            except ValueError as exc:
-                raise
-            detected = detect_bits_from_lspci(decoded_txt, orig_tmp)
-            if detected and detected[0] is not None:
-                print('Auto-detected mask/value from decoded lspci:')
-                print(detected[2])
-            if mask == 0:
-                print('Auto-detection failed from decoded lspci; cannot write without explicit --mask and --value or --level')
-                sys.exit(1)
-        else:
-            try:
-                mask = int(args.mask, 16)
-                val = int(args.value, 16)
-            except Exception:
-                print('Invalid mask/value')
-                sys.exit(1)
-
         ctl1_off = offset + 0x08
-        orig = backup_register(busid, ctl1_off)
+        orig = ctl1_val_orig if offline_mode else backup_register(busid, ctl1_off)
         try:
-            new = compute_new_value(orig, mask, val)
+            new_ctl1_val = compute_new_value(orig, mask, val)
         except Exception:
             raise
         print(f'Original L1SUBCTL1 @ 0x{ctl1_off:x}: 0x{orig:08x}')
+        print(f'Planned new value: 0x{new_ctl1_val:08x} (mask 0x{mask:x}, value 0x{val:x})')
+        pretty_print_l1subctl1(new_ctl1_val, ctl1_off, ' ', regs['L1SUBCAP'])
+
         action_desc = 'trial write' if args.trial else 'write'
-        print(f'Planned new value: 0x{new:08x} (mask 0x{mask:x}, value 0x{val:x})')
+        if offline_mode:
+            print(f'Offline mode: cannot perform {action_desc} when using --lspci-file. Run on the target machine instead.')
+            return
         if not args.force:
             print(f'Dry-run: use --force to actually perform the {action_desc}')
             return
 
         print(f'Performing {action_desc}...')
-        ok, written_val = perform_write_and_verify(busid, ctl1_off, new)
+        ok, written_val = perform_write_and_verify(busid, ctl1_off, new_ctl1_val)
         pretty_print_l1ss_lspci(run_lspci_vv(busid), 'after write')
 
         if not ok:
